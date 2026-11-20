@@ -1,0 +1,9 @@
+{
+  "name": "muka-med-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram-бот вымышленной кафе-пекарни «Мука & Мёд»: меню, бронь, коммерческое предложение. Бесплатная модель через OpenRouter.",
+  "private": true,
+  "scripts": { "start": "node --env-file=.env bot.js" },
+  "engines": { "node": ">=20.6" },
+  "license": "MIT"
+}

@@ -1,0 +1,7 @@
+.env
+node_modules
+.node
+.node-dl
+bot.log
+data/
+.DS_Store
