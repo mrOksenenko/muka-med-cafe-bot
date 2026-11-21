@@ -116,6 +116,30 @@ function stripMarkdown(text) {
     .replace(/`([^`]+)`/g, '$1');
 }
 
+// Защита от обхода подтверждения: заявку (BOOKING/LEAD) сохраняем, только если предыдущая реплика бота
+// была вопросом гостю «Всё верно? Отправляю?». Иначе модель могла «согласиться» вместо гостя.
+const CONFIRM_RE = /верно|подтверд|отправ|передать|согласу/i;
+
+function guardEvents(events, prevAssistant) {
+  const accepted = [];
+  const rejected = [];
+  for (const ev of events) {
+    const needsConfirm = ev.type === 'BOOKING' || ev.type === 'LEAD';
+    (needsConfirm && !CONFIRM_RE.test(prevAssistant) ? rejected : accepted).push(ev);
+  }
+  return { accepted, rejected };
+}
+
+// Сводка для повторного подтверждения, собранная кодом, а не моделью.
+function confirmationText(ev) {
+  const d = ev.data;
+  if (ev.type === 'BOOKING') {
+    return `Давайте сверим данные перед отправкой:\n• Имя: ${d.name}\n• Телефон: ${d.phone}\n• Дата: ${d.date}\n• Время: ${d.time}\n• Гостей: ${d.guests}` +
+      `${d.comment ? `\n• Пожелания: ${d.comment}` : ''}\n\nВсё верно? Напишите «Да», и я отправлю заявку администратору.`;
+  }
+  return `Проверим запрос перед отправкой:\n• Компания: ${d.company}\n• Формат: ${d.format}\n• Человек: ${d.people}\n• Дата: ${d.date}\n• Сумма: ${d.total} ₸\n\nВсё верно? Напишите «Да», чтобы передать запрос менеджеру.`;
+}
+
 const TITLES = { BOOKING: '📅 Новая заявка на бронь', LEAD: '💼 Запрос коммерческого предложения', HANDOFF: '🙋 Нужен администратор' };
 
 async function saveEvent(ev, msg) {
@@ -147,9 +171,12 @@ async function sendLong(chatId, text, extra = {}) {
 async function reply(msg, text) {
   const chatId = msg.chat.id;
   const history = histories.get(chatId) || [];
-  history.push({ role: 'user', content: text.slice(0, 2000) });
+  // Гость не должен подсовывать модели служебные метки [[...]].
+  history.push({ role: 'user', content: text.replace(/\[\[|\]\]/g, '').slice(0, 2000) });
   while (history.length > HISTORY_LIMIT) history.shift();
   histories.set(chatId, history);
+  const prev = history.at(-2);
+  const prevAssistant = prev?.role === 'assistant' ? prev.content : '';
 
   tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
   try {
@@ -162,10 +189,18 @@ async function reply(msg, text) {
       raw = await askModel(history);
     }
     const { clean, events } = extractMarkers(raw);
-    history.push({ role: 'assistant', content: clean || raw });
+    const { accepted, rejected } = guardEvents(events, prevAssistant);
+    // Если модель попыталась оформить заявку без подтверждения гостя, вместо её текста
+    // показываем сводку и просим подтвердить.
+    let answer = clean;
+    if (rejected.length) {
+      console.warn('Заявка без подтверждения отклонена:', rejected.map((e) => e.type).join(','));
+      answer = confirmationText(rejected[0]);
+    }
+    history.push({ role: 'assistant', content: answer || raw });
     while (history.length > HISTORY_LIMIT) history.shift();
-    for (const ev of events) await saveEvent(ev, msg);
-    await sendLong(chatId, stripMarkdown(clean) || 'Готово! Если нужна помощь, я на связи 🙂');
+    for (const ev of accepted) await saveEvent(ev, msg);
+    await sendLong(chatId, stripMarkdown(answer) || 'Готово! Если нужна помощь, я на связи 🙂');
   } catch (e) {
     console.error('Ошибка:', e.message);
     history.pop(); // не оставляем вопрос без ответа в истории
