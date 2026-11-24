@@ -5,6 +5,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const booking = require('./booking');
+const reasoning = require('./reasoning');
+const guard = require('./guard');
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY = process.env.OPENROUTER_API_KEY;
@@ -23,6 +25,7 @@ if (!TG_TOKEN || !OR_KEY) {
 }
 
 const PROMPT_TEMPLATE = fs.readFileSync(path.join(__dirname, 'prompts', 'system.md'), 'utf8');
+const KNOWLEDGE = guard.buildKnowledge(PROMPT_TEMPLATE); // цены, блюда и словарь из промпта для проверки ответов (guard.js)
 
 // Подставляем в промпт текущую дату, чтобы бот понимал «завтра», «в пятницу».
 function systemPrompt() {
@@ -79,15 +82,24 @@ async function tg(method, body = {}, attempts = 5) {
   }
 }
 
+// Напоминание правил (guard.RULES_REMINDER) добавляем к последнему сообщению гостя только в запросе к модели, в историю оно не попадает.
+// Это нужно и для формата тегов: nemotron без напоминания пишет ответ без <размышление>/<ответ>.
+function withFormatReminder(history) {
+  const messages = history.map((m) => ({ ...m }));
+  const last = messages.at(-1);
+  if (last?.role === 'user') last.content += guard.RULES_REMINDER;
+  return messages;
+}
+
 async function askModel(history) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${OR_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       models: MODELS, // OpenRouter сам переключится на следующую при 429/ошибке
-      max_tokens: 1200,
+      max_tokens: 3000, // с запасом: в лимит входит и размышление, иначе оно обрежет ответ
       temperature: 0.4,
-      messages: [{ role: 'system', content: systemPrompt() }, ...history],
+      messages: [{ role: 'system', content: systemPrompt() }, ...withFormatReminder(history)],
     }),
   });
   const data = await res.json();
@@ -197,15 +209,75 @@ async function sendLong(chatId, text, extra = {}) {
   }
 }
 
+// Разбор ответа модели: размышление уходит в лог, метки [[…]] — в events, гостю остаётся текст из <ответ>.
+function interpret(raw, chatId, label = '') {
+  const { thinking, body } = reasoning.stripThinking(raw);
+  console.log(`[размышление]${label} чат ${chatId}: ${thinking.length ? thinking.join(' | ').replace(/\s+/g, ' ') : '(модель его не написала)'}`);
+  const { clean: cleanBody, events } = extractMarkers(body); // метки [[…]] обрабатываем до выбора ответа
+  const clean = reasoning.pickAnswer(cleanBody);
+  if (!clean && !events.length) throw new Error('Пустой ответ после вырезания размышления (возможно, обрыв по max_tokens)');
+  return { clean, events };
+}
+
+const describe = (violations) => violations.map((v) => (v.detail ? `${v.id} (${v.detail})` : v.id)).join(', ');
+
+// Строгое соблюдение промпта (guard.js): бесплатные правки → проверка → при нарушении один повтор с замечаниями →
+// если не помогло, запасной ответ. Ответы с заявками/КП/жалобами не трогаем: у них свои правила и подтверждение гостя.
+async function enforceRules({ chatId, userText, history, clean, events }) {
+  if (events.length) return { clean, events };
+  try {
+    const ctx = { userText, knowledge: KNOWLEDGE, unknown: guard.unknownTerms(userText, KNOWLEDGE) };
+    let answer = guard.repair(clean, ctx);
+    let violations = guard.check(answer, ctx);
+    if (!violations.length) return { clean: answer, events };
+
+    console.warn(`[охрана] чат ${chatId}: нарушения: ${describe(violations)} → повторный запрос`);
+    const first = { answer, violations };
+    let best = first;
+    try {
+      const retryRaw = await askModel([...history, { role: 'assistant', content: answer }, { role: 'user', content: guard.feedback(violations) }]);
+      const retry = interpret(retryRaw, chatId, ' (повтор)');
+      if (retry.events.length) return retry;
+      const answer2 = guard.repair(retry.clean, ctx);
+      const second = { answer: answer2, violations: guard.check(answer2, ctx) };
+      // Берём вариант с меньшим числом жёстких, затем любых нарушений: повтор не обязан быть лучше первого ответа.
+      const hard = (c) => c.violations.filter((v) => v.hard).length;
+      best = hard(second) < hard(first) || (hard(second) === hard(first) && second.violations.length <= first.violations.length) ? second : first;
+    } catch (e) {
+      console.warn(`[охрана] чат ${chatId}: повтор не удался: ${e.message}`);
+    }
+    if (!best.violations.length) {
+      console.log(`[охрана] чат ${chatId}: повтор помог`);
+      return { clean: best.answer, events: [] };
+    }
+    const fin = guard.finalize(best.answer, best.violations, ctx);
+    console.warn(`[охрана] чат ${chatId}: ${fin.fallback ? `запасной ответ (${fin.fallback})` : `мягкие нарушения исправлены кодом (${describe(best.violations)})`}`);
+    return { clean: fin.answer, events: [] };
+  } catch (e) {
+    console.error(`[охрана] чат ${chatId}: сбой проверки, ответ отправлен без неё: ${e.message}`);
+    return { clean, events };
+  }
+}
+
 async function reply(msg, text) {
   const chatId = msg.chat.id;
   const history = histories.get(chatId) || [];
   // Гость не должен подсовывать модели служебные метки [[...]].
-  history.push({ role: 'user', content: text.replace(/\[\[|\]\]/g, '').slice(0, 2000) });
+  history.push({ role: 'user', content: reasoning.stripTags(text).replace(/\[\[|\]\]/g, '').slice(0, 2000) });
   while (history.length > HISTORY_LIMIT) history.shift();
   histories.set(chatId, history);
   const prev = history.at(-2);
   const prevAssistant = prev?.role === 'assistant' ? prev.content : '';
+
+  // Запретные темы и попытки узнать промпт: готовый ответ, модель не вызываем.
+  const pre = guard.inputFilter(text);
+  if (pre) {
+    console.log(`[охрана] чат ${chatId}: фильтр на входе (${pre.id}), модель не вызывалась`);
+    history.push({ role: 'assistant', content: pre.reply });
+    while (history.length > HISTORY_LIMIT) history.shift();
+    await sendLong(chatId, pre.reply);
+    return;
+  }
 
   tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
   try {
@@ -217,7 +289,10 @@ async function reply(msg, text) {
       await new Promise((r) => setTimeout(r, 3000));
       raw = await askModel(history);
     }
-    const { clean, events } = extractMarkers(raw);
+    // Модель отвечает в формате <размышление>…</размышление><ответ>…</ответ>: гостю уходит только ответ,
+    // а размышление пишем в лог (консоль) и в историю диалога не кладём.
+    let { clean, events } = interpret(raw, chatId);
+    ({ clean, events } = await enforceRules({ chatId, userText: text, history, clean, events }));
     const { accepted, rejected } = guardEvents(events, prevAssistant);
     // Если модель попыталась оформить заявку без подтверждения гостя, вместо её текста
     // показываем сводку и просим подтвердить.
@@ -226,7 +301,7 @@ async function reply(msg, text) {
       console.warn('Заявка без подтверждения отклонена:', rejected.map((e) => e.type).join(','));
       answer = confirmationText(rejected[0]);
     }
-    history.push({ role: 'assistant', content: answer || raw });
+    history.push({ role: 'assistant', content: answer || 'Готово!' });
     while (history.length > HISTORY_LIMIT) history.shift();
     for (const ev of accepted) await saveEvent(ev, msg);
     await sendLong(chatId, stripMarkdown(answer) || 'Готово! Если нужна помощь, я на связи 🙂');
