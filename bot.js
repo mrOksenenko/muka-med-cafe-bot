@@ -4,6 +4,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const booking = require('./booking');
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY = process.env.OPENROUTER_API_KEY;
@@ -14,6 +15,7 @@ const MODELS = (process.env.OPENROUTER_MODELS ||
   .split(',').map((s) => s.trim()).filter((m) => m.endsWith(':free')); // только бесплатные модели
 const HISTORY_LIMIT = 20; // сколько последних сообщений помнить на чат
 const DATA_DIR = path.join(__dirname, 'data');
+const BOOKINGS_FILE = path.join(__dirname, 'bookings.csv');
 
 if (!TG_TOKEN || !OR_KEY) {
   console.error('Нет TELEGRAM_BOT_TOKEN или OPENROUTER_API_KEY. Запускайте: node --env-file=.env bot.js');
@@ -33,6 +35,8 @@ function systemPrompt() {
 const TG = `https://api.telegram.org/bot${TG_TOKEN}`;
 const histories = new Map(); // chatId -> [{role, content}]
 const queues = new Map(); // chatId -> Promise: сообщения одного чата обрабатываем по очереди
+const bookingStates = new Map(); // chatId -> состояние приёма заявки (см. booking.js)
+const BOOK_RE = /забронир|брон[ьиюе]|брониров|столик/iu; // свободный текст, с которого начинается заявка
 
 const GREETING =
   'Привет! Я Миша, виртуальный помощник кафе-пекарни «Мука & Мёд» 🥐\n' +
@@ -91,6 +95,31 @@ async function askModel(history) {
   if (!text) throw new Error(data.error?.message || 'Пустой ответ модели');
   return text;
 }
+
+// Отдельный запрос к модели для заявки: на выходе только JSON (см. booking.js), без истории и личности бота.
+async function callExtractor(system, user) {
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OR_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      models: MODELS,
+      max_tokens: 300,
+      temperature: 0,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    }),
+  });
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content;
+  if (typeof text !== 'string' || !text.trim()) throw new Error(data.error?.message || 'Пустой ответ модели');
+  return text;
+}
+
+const bookingDeps = {
+  callModel: callExtractor,
+  now: () => new Date(),
+  tz: TIMEZONE,
+  save: (record) => booking.appendBooking(BOOKINGS_FILE, record),
+};
 
 // Модель в конце ответа добавляет служебную метку [[BOOKING {...}]], [[LEAD {...}]] или [[HANDOFF {...}]].
 // Гостю метка не показывается: бот вырезает её и сохраняет заявку.
@@ -208,6 +237,46 @@ async function reply(msg, text) {
   }
 }
 
+// Заявка на столик: гость начинает её командой /book, кнопкой или словами «забронировать», «столик».
+// Дальше каждое его сообщение идёт в booking.step, пока заявка не сохранена или не отменена.
+async function startBooking(chatId, user) {
+  bookingStates.set(chatId, booking.newState('date', { chat_id: chatId, username: user?.username || '' }));
+  await sendLong(chatId, booking.FIRST_PROMPT);
+}
+
+async function notifyAdminBooking(record, msg) {
+  if (!ADMIN_CHAT_ID) return;
+  const from = msg.from?.username ? `@${msg.from.username}` : `chat ${msg.chat.id}`;
+  const lines = ['name', 'phone', 'date', 'time', 'guests'].map((k) => `${k}: ${record[k]}`);
+  await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `📅 Новая заявка на бронь\nот ${from}\n\n${lines.join('\n')}` })
+    .catch((e) => console.error('Не удалось уведомить администратора:', e.message));
+}
+
+async function runBooking(msg, text) {
+  const chatId = msg.chat.id;
+  const state = bookingStates.get(chatId);
+  tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+  try {
+    const res = await booking.step(state, text, bookingDeps);
+    if (res.passthrough) {
+      // Сообщение не про заявку (например, вопрос о парковке): отвечает обычный чат.
+      // Черновик с данными сохраняем, пустой — выбрасываем.
+      if (!booking.hasData(state)) bookingStates.delete(chatId);
+      return reply(msg, text);
+    }
+    if (res.state) { res.state.ts = Date.now(); bookingStates.set(chatId, res.state); } else bookingStates.delete(chatId);
+    if (res.saved) {
+      // Строка в bookings.csv уже записана внутри step (bookingDeps.save), здесь только уведомление.
+      console.log('BOOKING:', JSON.stringify(res.saved));
+      await notifyAdminBooking(res.saved, msg);
+    }
+    await sendLong(chatId, res.reply);
+  } catch (e) {
+    console.error('Ошибка заявки:', e.message);
+    await sendLong(chatId, 'Кажется, на кухне небольшая заминка 🙈 Попробуйте ещё раз через минуту или позвоните: +7 (700) 123-45-67.');
+  }
+}
+
 async function handleMessage(msg) {
   const text = msg.text;
   if (!text) return;
@@ -216,23 +285,35 @@ async function handleMessage(msg) {
 
   if (cmd === '/start') {
     histories.delete(chatId);
+    bookingStates.delete(chatId);
     return sendLong(chatId, GREETING, { reply_markup: KEYBOARD });
   }
   if (cmd === '/reset') {
     histories.delete(chatId);
+    bookingStates.delete(chatId);
     return sendLong(chatId, 'Диалог начат заново. Чем могу помочь?', { reply_markup: KEYBOARD });
   }
   if (cmd === '/menu') return reply(msg, QUICK.menu);
-  if (cmd === '/book') return reply(msg, QUICK.book);
+  if (cmd === '/book') return startBooking(chatId, msg.from);
   if (cmd === '/offer') return reply(msg, QUICK.offer);
   if (cmd === '/contacts') return reply(msg, QUICK.contacts);
+
+  let state = bookingStates.get(chatId);
+  if (state && booking.isExpired(state)) { bookingStates.delete(chatId); state = undefined; }
+  if (state) return runBooking(msg, text);
+  if (BOOK_RE.test(text)) {
+    bookingStates.set(chatId, booking.newState(null, { chat_id: chatId, username: msg.from?.username || '' }));
+    return runBooking(msg, text);
+  }
   return reply(msg, text);
 }
 
 async function handleCallback(cq) {
   tg('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
+  if (!cq.message) return;
+  if (cq.data === 'book') return startBooking(cq.message.chat.id, cq.from);
   const question = QUICK[cq.data];
-  if (!question || !cq.message) return;
+  if (!question) return;
   return reply({ chat: cq.message.chat, from: cq.from }, question);
 }
 

@@ -1,7 +1,16 @@
+# Секреты: ключи и токены
 .env
-node_modules
+.env.*
+!.env.example
+
+# Данные гостей и логи
+bookings.csv
+data/
+*.log
+bot.log
+
+# Служебное
 .node
 .node-dl
-bot.log
-data/
+node_modules
 .DS_Store
