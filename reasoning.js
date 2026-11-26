@@ -29,4 +29,13 @@ function stripTags(text) {
   return String(text).replace(/<\/?(?:ответ|размышление)>/gi, '');
 }
 
-module.exports = { stripThinking, pickAnswer, stripTags };
+// Системный промпт для режима без рассуждения (REASONING=off): убираем раздел «ФОРМАТ ОТВЕТА»,
+// а из примеров — блоки размышления и теги <ответ>. Остальное (меню, правила, сами примеры) не меняется.
+function promptWithoutReasoning(template) {
+  return String(template)
+    .replace(/^# ФОРМАТ ОТВЕТА\n[\s\S]*?(?=^<примеры>$)/m, '')
+    .replace(/^<размышление>\n[\s\S]*?^<\/размышление>\n/gm, '')
+    .replace(/^<\/?ответ>\n/gm, '');
+}
+
+module.exports = { stripThinking, pickAnswer, stripTags, promptWithoutReasoning };

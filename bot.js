@@ -27,12 +27,17 @@ if (!TG_TOKEN || !OR_KEY) {
 const PROMPT_TEMPLATE = fs.readFileSync(path.join(__dirname, 'prompts', 'system.md'), 'utf8');
 const KNOWLEDGE = guard.buildKnowledge(PROMPT_TEMPLATE); // цены, блюда и словарь из промпта для проверки ответов (guard.js)
 
+// Режим рассуждения: REASONING=off — модель отвечает сразу. EXPERIMENT=1 — замеры пишутся в data/experiment.jsonl.
+const REASONING = (process.env.REASONING || 'on').toLowerCase() !== 'off';
+const EXPERIMENT = process.env.EXPERIMENT === '1';
+const ACTIVE_PROMPT = REASONING ? PROMPT_TEMPLATE : reasoning.promptWithoutReasoning(PROMPT_TEMPLATE);
+
 // Подставляем в промпт текущую дату, чтобы бот понимал «завтра», «в пятницу».
 function systemPrompt() {
   const d = new Date();
   const human = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'full', timeStyle: 'short', timeZone: TIMEZONE }).format(d);
   const iso = new Intl.DateTimeFormat('sv-SE', { timeZone: TIMEZONE }).format(d); // ГГГГ-ММ-ДД
-  return PROMPT_TEMPLATE.replaceAll('{{NOW}}', `${human} (${iso}), часовой пояс ${TIMEZONE}`);
+  return ACTIVE_PROMPT.replaceAll('{{NOW}}', `${human} (${iso}), часовой пояс ${TIMEZONE}`);
 }
 
 const TG = `https://api.telegram.org/bot${TG_TOKEN}`;
@@ -87,26 +92,53 @@ async function tg(method, body = {}, attempts = 5) {
 function withFormatReminder(history) {
   const messages = history.map((m) => ({ ...m }));
   const last = messages.at(-1);
-  if (last?.role === 'user') last.content += guard.RULES_REMINDER;
+  if (last?.role === 'user') last.content += guard.rulesReminder(REASONING);
   return messages;
 }
 
-async function askModel(history) {
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OR_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      models: MODELS, // OpenRouter сам переключится на следующую при 429/ошибке
-      max_tokens: 3000, // с запасом: в лимит входит и размышление, иначе оно обрежет ответ
-      temperature: 0.4,
-      messages: [{ role: 'system', content: systemPrompt() }, ...withFormatReminder(history)],
-    }),
-  });
-  const data = await res.json();
-  const text = data.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error(data.error?.message || 'Пустой ответ модели');
-  return text;
+// calls — необязательный список, куда пишется замер каждого запроса: время, модель, токены, сырой ответ.
+async function askModel(history, calls) {
+  const started = Date.now();
+  const note = (info) => calls?.push({ ms: Date.now() - started, ...info });
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OR_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        models: MODELS, // OpenRouter сам переключится на следующую при 429/ошибке
+        max_tokens: 3000, // с запасом: в лимит входит и размышление, иначе оно обрежет ответ
+        temperature: 0.4,
+        messages: [{ role: 'system', content: systemPrompt() }, ...withFormatReminder(history)],
+      }),
+    });
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new Error(data.error?.message || 'Пустой ответ модели');
+    note({
+      model: data.model,
+      completion_tokens: data.usage?.completion_tokens,
+      reasoning_tokens: data.usage?.completion_tokens_details?.reasoning_tokens, // скрытое рассуждение самой модели, если она его сообщает
+      raw: text,
+    });
+    return text;
+  } catch (e) {
+    note({ error: e.message });
+    throw e;
+  }
 }
+
+function logExperiment(question, trace, answer, route = 'chat') {
+  if (!EXPERIMENT) return;
+  const record = {
+    time: new Date().toISOString(), reasoning: REASONING ? 'on' : 'off', route, question,
+    total_ms: Date.now() - trace.started, guard: trace.guard, calls: trace.calls, answer,
+  };
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.appendFileSync(path.join(DATA_DIR, 'experiment.jsonl'), JSON.stringify(record) + '\n');
+  console.log(`[замер] reasoning=${record.reasoning} ${record.total_ms} мс, запросов к модели: ${trace.calls.length}`);
+}
+
+const newTrace = () => ({ started: Date.now(), calls: [], guard: [] });
 
 // Отдельный запрос к модели для заявки: на выходе только JSON (см. booking.js), без истории и личности бота.
 async function callExtractor(system, user) {
@@ -212,7 +244,9 @@ async function sendLong(chatId, text, extra = {}) {
 // Разбор ответа модели: размышление уходит в лог, метки [[…]] — в events, гостю остаётся текст из <ответ>.
 function interpret(raw, chatId, label = '') {
   const { thinking, body } = reasoning.stripThinking(raw);
-  console.log(`[размышление]${label} чат ${chatId}: ${thinking.length ? thinking.join(' | ').replace(/\s+/g, ' ') : '(модель его не написала)'}`);
+  if (REASONING || thinking.length) {
+    console.log(`[размышление]${label} чат ${chatId}: ${thinking.length ? thinking.join(' | ').replace(/\s+/g, ' ') : '(модель его не написала)'}`);
+  }
   const { clean: cleanBody, events } = extractMarkers(body); // метки [[…]] обрабатываем до выбора ответа
   const clean = reasoning.pickAnswer(cleanBody);
   if (!clean && !events.length) throw new Error('Пустой ответ после вырезания размышления (возможно, обрыв по max_tokens)');
@@ -223,7 +257,7 @@ const describe = (violations) => violations.map((v) => (v.detail ? `${v.id} (${v
 
 // Строгое соблюдение промпта (guard.js): бесплатные правки → проверка → при нарушении один повтор с замечаниями →
 // если не помогло, запасной ответ. Ответы с заявками/КП/жалобами не трогаем: у них свои правила и подтверждение гостя.
-async function enforceRules({ chatId, userText, history, clean, events }) {
+async function enforceRules({ chatId, userText, history, clean, events, trace }) {
   if (events.length) return { clean, events };
   try {
     const ctx = { userText, knowledge: KNOWLEDGE, unknown: guard.unknownTerms(userText, KNOWLEDGE) };
@@ -231,11 +265,12 @@ async function enforceRules({ chatId, userText, history, clean, events }) {
     let violations = guard.check(answer, ctx);
     if (!violations.length) return { clean: answer, events };
 
+    trace?.guard.push(`нарушения: ${describe(violations)}`);
     console.warn(`[охрана] чат ${chatId}: нарушения: ${describe(violations)} → повторный запрос`);
     const first = { answer, violations };
     let best = first;
     try {
-      const retryRaw = await askModel([...history, { role: 'assistant', content: answer }, { role: 'user', content: guard.feedback(violations) }]);
+      const retryRaw = await askModel([...history, { role: 'assistant', content: answer }, { role: 'user', content: guard.feedback(violations, REASONING) }], trace?.calls);
       const retry = interpret(retryRaw, chatId, ' (повтор)');
       if (retry.events.length) return retry;
       const answer2 = guard.repair(retry.clean, ctx);
@@ -251,6 +286,7 @@ async function enforceRules({ chatId, userText, history, clean, events }) {
       return { clean: best.answer, events: [] };
     }
     const fin = guard.finalize(best.answer, best.violations, ctx);
+    trace?.guard.push(fin.fallback ? `запасной ответ (${fin.fallback})` : 'мягкие нарушения исправлены кодом');
     console.warn(`[охрана] чат ${chatId}: ${fin.fallback ? `запасной ответ (${fin.fallback})` : `мягкие нарушения исправлены кодом (${describe(best.violations)})`}`);
     return { clean: fin.answer, events: [] };
   } catch (e) {
@@ -269,12 +305,16 @@ async function reply(msg, text) {
   const prev = history.at(-2);
   const prevAssistant = prev?.role === 'assistant' ? prev.content : '';
 
+  const trace = newTrace();
+
   // Запретные темы и попытки узнать промпт: готовый ответ, модель не вызываем.
   const pre = guard.inputFilter(text);
   if (pre) {
     console.log(`[охрана] чат ${chatId}: фильтр на входе (${pre.id}), модель не вызывалась`);
     history.push({ role: 'assistant', content: pre.reply });
     while (history.length > HISTORY_LIMIT) history.shift();
+    trace.guard.push(`фильтр на входе (${pre.id})`);
+    logExperiment(text, trace, pre.reply, 'filter');
     await sendLong(chatId, pre.reply);
     return;
   }
@@ -283,16 +323,16 @@ async function reply(msg, text) {
   try {
     let raw;
     try {
-      raw = await askModel(history);
+      raw = await askModel(history, trace.calls);
     } catch (e) {
       console.warn('Повтор после ошибки:', e.message);
       await new Promise((r) => setTimeout(r, 3000));
-      raw = await askModel(history);
+      raw = await askModel(history, trace.calls);
     }
     // Модель отвечает в формате <размышление>…</размышление><ответ>…</ответ>: гостю уходит только ответ,
     // а размышление пишем в лог (консоль) и в историю диалога не кладём.
     let { clean, events } = interpret(raw, chatId);
-    ({ clean, events } = await enforceRules({ chatId, userText: text, history, clean, events }));
+    ({ clean, events } = await enforceRules({ chatId, userText: text, history, clean, events, trace }));
     const { accepted, rejected } = guardEvents(events, prevAssistant);
     // Если модель попыталась оформить заявку без подтверждения гостя, вместо её текста
     // показываем сводку и просим подтвердить.
@@ -304,9 +344,11 @@ async function reply(msg, text) {
     history.push({ role: 'assistant', content: answer || 'Готово!' });
     while (history.length > HISTORY_LIMIT) history.shift();
     for (const ev of accepted) await saveEvent(ev, msg);
+    logExperiment(text, trace, stripMarkdown(answer));
     await sendLong(chatId, stripMarkdown(answer) || 'Готово! Если нужна помощь, я на связи 🙂');
   } catch (e) {
     console.error('Ошибка:', e.message);
+    logExperiment(text, trace, `ОШИБКА: ${e.message}`, 'error');
     history.pop(); // не оставляем вопрос без ответа в истории
     await sendLong(chatId, 'Кажется, на кухне небольшая заминка 🙈 Попробуйте ещё раз через минуту или позвоните: +7 (700) 123-45-67.');
   }
@@ -331,6 +373,7 @@ async function runBooking(msg, text) {
   const chatId = msg.chat.id;
   const state = bookingStates.get(chatId);
   tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+  const trace = newTrace();
   try {
     const res = await booking.step(state, text, bookingDeps);
     if (res.passthrough) {
@@ -345,6 +388,7 @@ async function runBooking(msg, text) {
       console.log('BOOKING:', JSON.stringify(res.saved));
       await notifyAdminBooking(res.saved, msg);
     }
+    logExperiment(text, trace, res.reply, 'booking'); // приём заявки идёт своим промптом, рассуждение здесь не участвует
     await sendLong(chatId, res.reply);
   } catch (e) {
     console.error('Ошибка заявки:', e.message);
@@ -412,6 +456,7 @@ async function main() {
     ],
   }).catch((e) => console.warn('setMyCommands:', e.message));
   console.log(`Бот @${me.username} запущен. Модели: ${MODELS.join(' → ')}`);
+  console.log(`Режим reasoning: ${REASONING ? 'включён' : 'ВЫКЛЮЧЕН'}${EXPERIMENT ? ', замеры пишутся в data/experiment.jsonl' : ''}`);
   console.log(ADMIN_CHAT_ID ? 'Заявки дублируются администратору.' : 'ADMIN_CHAT_ID не задан: заявки только в data/requests.jsonl.');
 
   let offset = 0;
