@@ -178,6 +178,12 @@ function splitSentences(text) {
   return out;
 }
 
+// «Два латте» и «2 латте» для расчёта одно и то же, поэтому количество словами переводим в цифры.
+const NUMBER_WORDS = { один: 1, одна: 1, одно: 1, одну: 1, два: 2, две: 2, двух: 2, пара: 2, пару: 2, три: 3, трех: 3, трёх: 3,
+  четыре: 4, пять: 5, шесть: 6, семь: 7, восемь: 8, девять: 9, десять: 10 };
+const NUMBER_WORD_RE = new RegExp(`(?<![\\p{L}])(?:${Object.keys(NUMBER_WORDS).join('|')})(?![\\p{L}])`, 'giu');
+const wordsToDigits = (text) => String(text).replace(NUMBER_WORD_RE, (w) => NUMBER_WORDS[w.toLowerCase()]);
+
 // Числа с ₸ из ответа и проверка каждого по меню: имя блюда рядом -> его цена; иначе любая цена меню.
 // Итоги разрешены, если складываются из других цен в этом же ответе (в том числе «k × цена») или из цен блюд,
 // названных в вопросе гостя и в ответе («латте с миндальным молоком» = 1600 + 300).
@@ -190,7 +196,7 @@ function badPrices(answer, knowledge, userText = '') {
   const combos = mentionedTotals(`${userText} ${answer}`.toLowerCase(), knowledge);
   const order = orderTotals(userText, knowledge); // «2 капучино, 3 круассана…» → итог всего заказа
   // Количества из вопроса и ответа («2 капучино»): цена блюда, умноженная на количество, тоже законна.
-  const quantities = [...`${userText} ${answer}`.matchAll(/(?<![\d:])(\d{1,2})(?![\d:]|\s*(?:₸|тг|тенге))/gu)]
+  const quantities = [...wordsToDigits(`${userText} ${answer}`).matchAll(/(?<![\d:])(\d{1,2})(?![\d:]|\s*(?:₸|тг|тенге))/gu)]
     .map((m) => Number(m[1])).filter((k) => k >= 2 && k <= 20);
   const bad = [];
   found.forEach((p, i) => {
@@ -228,7 +234,7 @@ function mentionedTotals(text, knowledge) {
 function orderTotals(userText, knowledge) {
   let totals = new Set([0]);
   let parts = 0;
-  for (const segment of String(userText).toLowerCase().split(/[,;\n+]|\s+и\s+|\s+плюс\s+/u).slice(0, 8)) {
+  for (const segment of wordsToDigits(userText).toLowerCase().split(/[,;\n+]|\s+и\s+|\s+плюс\s+/u).slice(0, 8)) {
     const options = mentionedTotals(segment, knowledge);
     if (!options.size) continue;
     const count = Number(/(?<![\d:])(\d{1,2})(?![\d:])/.exec(segment)?.[1] || 1);

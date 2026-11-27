@@ -90,6 +90,17 @@ test('цены: выдуманные и чужие цены ловятся', () 
   assert.deepEqual(g.badPrices('Пицца Маргарита — 3000 ₸.', knowledge), [3000]);
 });
 
+test('цены: количество словом («два латте») считается так же, как цифрой', () => {
+  const q = 'Посчитай два латте';
+  for (const a of ['Два латте — 3200 ₸.', 'Два латте будут стоить 3200 ₸.', '2 латте — 3200 ₸.']) {
+    assert.deepEqual(g.badPrices(a, knowledge, q), [], a);
+  }
+  assert.deepEqual(g.badPrices('Два латте — 3000 ₸.', knowledge, q), [3000]); // неверная сумма всё ещё ловится
+  const order = 'Посчитай два латте, три эклера и чизкейк';
+  assert.deepEqual(g.badPrices('Вместе 10 100 ₸.', knowledge, order), []); // 3200 + 4500 + 2400
+  assert.deepEqual(g.badPrices('Вместе 10 000 ₸.', knowledge, order), [10000]);
+});
+
 // ---------- проверки ответа на реальных ответах модели из test_cases.md ----------
 
 test('провал из test_cases: аниматор — оба ответа ловятся как выдумка', () => {
